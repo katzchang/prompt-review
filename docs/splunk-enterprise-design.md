@@ -21,33 +21,34 @@
 ┌─────────────────────────────────────────────────────┐
 │  各メンバーのPC                                       │
 │                                                       │
-│  AIツールのログ → collect.py --emit-otel              │
-│  (Claude Code, Copilot, Cline, etc.)                  │
+│  Claude Code セッション JSONL                         │
+│  (~/.claude/projects/*/*.jsonl)                       │
 │                                                       │
-│       ↓ OTLP (gRPC/HTTP)                              │
+│       ↓ filelog receiver                              │
 │                                                       │
 │  OTel Collector                                       │
-│  ├── receiver: filelog / otlp                         │
-│  ├── processor: attributes (user, host)               │
-│  └── exporter: splunk_hec                             │
+│  ├── receiver: filelog (JSONL監視)                    │
+│  ├── processor: batch                                │
+│  └── exporter: splunk_hec                            │
 └───────────────┬─────────────────────────────────────┘
                 ↓ HEC (HTTPS)
 ┌───────────────────────────────────────────────────────┐
 │  Splunk Enterprise                                     │
 │                                                       │
-│  index: ai_prompt_logs                                │
-│  sourcetype: ai_prompt_review                         │
+│  index: claude_code                                   │
+│  sourcetype: claude:session                           │
 │                                                       │
-│  フィールド:                                           │
-│  ├── user        (メンバー名)                          │
-│  ├── tool        (Claude Code, Copilot, etc.)         │
-│  ├── project     (プロジェクト名)                      │
-│  ├── prompt_text (プロンプト本文)                      │
-│  ├── prompt_len  (文字数)                              │
-│  ├── session_id  (セッション識別子)                    │
-│  └── _time       (タイムスタンプ)                      │
+│  生データ（セッションJSONL そのまま）:                   │
+│  ├── type         (user / assistant / system / ...)   │
+│  ├── message.content  (プロンプト本文 ※文字列時)       │
+│  ├── sessionId    (セッション識別子)                    │
+│  ├── cwd          (作業ディレクトリ → プロジェクト名)   │
+│  ├── gitBranch    (ブランチ名)                         │
+│  ├── host         (送信元ホスト → ユーザー識別)         │
+│  ├── timestamp    (イベントタイムスタンプ)               │
+│  └── entrypoint   (cli / vscode)                      │
 └───────────────┬───────────────────────────────────────┘
-                ↓ SPL via MCP
+                ↓ SPL via Splunk Enterprise MCP
 ┌───────────────────────────────────────────────────────┐
 │  Claude Code + Splunk Enterprise MCP                   │
 │                                                       │
@@ -58,136 +59,196 @@
 └───────────────────────────────────────────────────────┘
 ```
 
+**設計方針**: collect.py による前処理は行わず、Claude Code のセッション JSONL を OTel Collector で
+そのまま Splunk に送信する。ユーザープロンプトの抽出・整形は SPL クエリ側で行う。
+
 ---
 
-## 1. ログスキーマ設計
+## 1. Splunk 上のデータ構造
 
-### Splunk イベント形式
+### 既存環境（検証済み）
 
-```json
-{
-  "_time": 1710335400,
-  "user": "tanaka",
-  "tool": "Claude Code",
-  "project": "hello-splunk",
-  "prompt_text": "OTel Collectorの設定をHEC exporterに変更して",
-  "prompt_len": 28,
-  "session_id": "a1b2c3d4-e5f6-7890",
-  "host": "tanaka-macbook"
-}
-```
+| 項目 | 値 |
+|------|-----|
+| index | `claude_code` |
+| sourcetype | `claude:session` |
+| source | `otel-collector` |
+| 送信方式 | OTel Collector filelog receiver → Splunk HEC |
 
-### フィールド定義
+### イベント種別（type フィールド）
 
-| フィールド | 型 | 説明 | 例 |
-|-----------|-----|------|-----|
-| `_time` | epoch | メッセージのタイムスタンプ | `1710335400` |
-| `user` | string | メンバー識別子 | `tanaka` |
-| `tool` | string | AIツール名 | `Claude Code` |
-| `project` | string | プロジェクト名 | `hello-splunk` |
-| `prompt_text` | string | プロンプト本文（500文字上限） | `OTel Collectorの設定を...` |
-| `prompt_len` | int | プロンプトの文字数 | `28` |
-| `session_id` | string | セッション識別子 | `a1b2c3d4-...` |
-| `host` | string | 送信元ホスト名 | `tanaka-macbook` |
+| type | 件数目安 | 内容 |
+|------|---------|------|
+| `user` | 数百件 | ユーザー入力（プロンプト + tool_result返却） |
+| `assistant` | 数百件 | アシスタント応答 |
+| `file-history-snapshot` | 数十万件 | ファイル変更スナップショット（大量） |
+| `system` | 数十件 | システムメッセージ |
+| `progress` | 数十件 | 進捗通知 |
+| `last-prompt` | 数件 | 最終プロンプト記録 |
 
-### Splunk 設定
+### ユーザープロンプトの識別方法
 
-```
-# indexes.conf
-[ai_prompt_logs]
-homePath   = $SPLUNK_DB/ai_prompt_logs/db
-coldPath   = $SPLUNK_DB/ai_prompt_logs/colddb
-thawedPath = $SPLUNK_DB/ai_prompt_logs/thaweddb
+Claude Code の `type="user"` イベントには2種類ある:
 
-# props.conf
-[ai_prompt_review]
-TIME_FORMAT = %s
-SHOULD_LINEMERGE = false
-KV_MODE = json
-```
+1. **ユーザーの直接入力** — `message.content` が**文字列**
+2. **tool_result の返却** — `message.content` が**配列**（`tool_use_id` を含む）
+
+分析対象は (1) のみ。以下で除外が必要:
+- `tool_result` / `tool_use_id` を含むイベント（ツール実行結果）
+- `<local-command-stdout>` 等のシステムタグで始まるテキスト
+- `[Request interrupted` で始まるテキスト（中断通知）
 
 ---
 
 ## 2. データパイプライン
 
-### 2a. collect.py の拡張
-
-既存の collect.py に `--emit-otel` オプションを追加。既存の JSON stdout 出力はそのまま残す。
-
-```
-python collect.py --emit-otel --user tanaka
-```
-
-動作:
-1. 既存と同じくローカルログを収集
-2. 収集したメッセージを OTel Log として OTLP エンドポイントに送信
-3. `--user` で指定されたユーザー名をリソース属性に付与
-
-必要な追加パッケージ:
-- `opentelemetry-sdk`
-- `opentelemetry-exporter-otlp`
-
-### 2b. OTel Collector 設定
+### OTel Collector 設定
 
 ```yaml
 # otel-collector-config.yaml
 receivers:
-  otlp:
-    protocols:
-      grpc:
-        endpoint: 0.0.0.0:4317
-      http:
-        endpoint: 0.0.0.0:4318
+  filelog/session:
+    include:
+      - ${HOME}/.claude/projects/*/*.jsonl
+    start_at: end
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.timestamp
+          layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+    resource:
+      source: claude-code-session
 
 processors:
   batch:
     timeout: 5s
     send_batch_size: 100
 
-  # クレデンシャルのマスク処理（collect.pyで実施済みだが二重防御）
-  attributes:
-    actions:
-      - key: prompt_text
-        action: hash
-        # 注: 本番ではredactionプロセッサの検討も
-
 exporters:
   splunkhec:
     token: "${SPLUNK_HEC_TOKEN}"
     endpoint: "https://splunk.example.com:8088"
-    source: "ai_prompt_review"
-    sourcetype: "ai_prompt_review"
-    index: "ai_prompt_logs"
+    source: "otel-collector"
+    sourcetype: "claude:session"
+    index: "claude_code"
     tls:
       insecure_skip_verify: false
 
 service:
   pipelines:
     logs:
-      receivers: [otlp]
+      receivers: [filelog/session]
       processors: [batch]
       exporters: [splunkhec]
 ```
 
-### 2c. 運用方法（メンバー側）
+### 組織展開時の追加考慮
 
-各メンバーのPCで定期実行（cron / タスクスケジューラ）:
+- **ユーザー識別**: 現状は `host` フィールドでホスト名から識別。組織利用では OTel Collector の
+  resource processor で `user` 属性を明示的に付与することを推奨
+- **他AIツール対応**: 現状は Claude Code のみ。Copilot Chat, Cline 等を追加する場合は
+  collect.py の OTel 出力オプション追加、または各ツール用の filelog receiver を追加
 
-```bash
-# 毎日1回、前日分のログを送信
-0 9 * * * python collect.py --emit-otel --user $(whoami) --days 1
+---
+
+## 3. SPLクエリ設計（検証済み）
+
+### 基本: ユーザープロンプト抽出
+
+```spl
+index=claude_code sourcetype="claude:session" type="user"
+  NOT "tool_result" NOT "tool_use_id"
+| spath output=prompt_text path="message.content"
+| where isnotnull(prompt_text)
+  AND NOT match(prompt_text, "^<")
+  AND NOT match(prompt_text, "^\[Request")
+| eval project=replace(cwd, ".*/", ""),
+       prompt_len=len(prompt_text)
+```
+
+このベースクエリを `base_user_prompts` として以下の各クエリで参照する。
+
+### 3a. プロンプト本文取得（定性分析用）
+
+```spl
+index=claude_code sourcetype="claude:session" type="user"
+  NOT "tool_result" NOT "tool_use_id"
+| spath output=prompt_text path="message.content"
+| where isnotnull(prompt_text)
+  AND NOT match(prompt_text, "^<")
+  AND NOT match(prompt_text, "^\[Request")
+  AND len(prompt_text) > 20
+| eval project=replace(cwd, ".*/", "")
+| table _time, host, sessionId, project, gitBranch, prompt_text
+| sort _time
+| head 200
+```
+
+特定ユーザー（ホスト）に絞る場合: `host="tanaka-macbook"` を追加
+
+### 3b. サマリー統計（定量分析用）
+
+```spl
+index=claude_code sourcetype="claude:session" type="user"
+  NOT "tool_result" NOT "tool_use_id"
+| spath output=prompt_text path="message.content"
+| where isnotnull(prompt_text)
+  AND NOT match(prompt_text, "^<")
+  AND NOT match(prompt_text, "^\[Request")
+| eval project=replace(cwd, ".*/", ""),
+       prompt_len=len(prompt_text)
+| stats
+    count AS total_messages,
+    dc(sessionId) AS sessions,
+    dc(project) AS projects,
+    avg(prompt_len) AS avg_prompt_len,
+    values(project) AS project_list
+  by host
+| sort -total_messages
+```
+
+### 3c. プロジェクト別集計
+
+```spl
+index=claude_code sourcetype="claude:session" type="user"
+  NOT "tool_result" NOT "tool_use_id"
+| spath output=prompt_text path="message.content"
+| where isnotnull(prompt_text)
+  AND NOT match(prompt_text, "^<")
+  AND NOT match(prompt_text, "^\[Request")
+| eval project=replace(cwd, ".*/", "")
+| stats count AS messages, dc(host) AS users, dc(sessionId) AS sessions by project
+| sort -messages
+```
+
+### 3d. 時系列推移（日別）
+
+```spl
+index=claude_code sourcetype="claude:session" type="user"
+  NOT "tool_result" NOT "tool_use_id"
+| spath output=prompt_text path="message.content"
+| where isnotnull(prompt_text)
+  AND NOT match(prompt_text, "^<")
+  AND NOT match(prompt_text, "^\[Request")
+| timechart span=1d count by host
+```
+
+### 3e. 短文肯定応答の除外（分析精度向上）
+
+既存スキルと同様、短文の肯定応答を除外する追加フィルタ:
+
+```spl
+| where prompt_len > 20
+  OR NOT match(prompt_text, "^(y|yes|はい|うん|ok|sure|yep|yeah|進めて|やって|do it|go|go ahead|proceed|それで|お願いします|いいよ|大丈夫|ありがとう|thanks|thx)$")
 ```
 
 ---
 
-## 3. スキル設計（prompt-review-org）
+## 4. スキル設計（prompt-review-org）
 
 ### 前提: Splunk Enterprise MCP
 
-Splunk Enterprise MCP サーバーが以下のツールを提供する想定:
-- `splunk_search` — SPLクエリを実行して結果を返す
-
-MCP が提供するツール名は実際のサーバーに合わせて調整する。
+MCP ツール `mcp__splunk-mcp-server__splunk_run_query` を使用してSPLクエリを実行する。
 
 ### SKILL.md 構成
 
@@ -195,55 +256,15 @@ MCP が提供するツール名は実際のサーバーに合わせて調整す�
 .claude/skills/prompt-review-org/
 ├── SKILL.md                    # スキル定義
 └── references/
-    ├── spl-queries.md          # SPLクエリ集
+    ├── spl-queries.md          # SPLクエリ集（上記セクション3の内容）
     └── report-template-org.md  # 組織レポートテンプレート
 ```
 
 ### ステップ1: SPLクエリでデータ取得
 
-collect.py は不要。代わりにSplunk MCP経由でSPLクエリを実行する。
-
-**全体サマリー取得:**
-```spl
-index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-7d
-| stats count by user, tool, project
-| sort -count
-```
-
-**特定ユーザーのプロンプト本文取得:**
-```spl
-index=ai_prompt_logs sourcetype=ai_prompt_review user="tanaka" earliest=-7d
-| where prompt_len > 20
-| table _time, tool, project, prompt_text
-| sort _time
-| head 200
-```
-
-**組織全体の定量指標:**
-```spl
-index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-7d
-| stats
-    count AS total_messages,
-    dc(user) AS active_users,
-    dc(project) AS active_projects,
-    avg(prompt_len) AS avg_prompt_length,
-    values(tool) AS tools_used
-  by user
-| sort -total_messages
-```
-
-**ツール利用分布:**
-```spl
-index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-7d
-| stats count by user, tool
-| chart sum(count) over user by tool
-```
-
-**時系列推移（日別）:**
-```spl
-index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
-| timechart span=1d count by user
-```
+1. サマリー統計（3b）を実行 → ユーザー・プロジェクトの全体像を把握
+2. プロジェクト別集計（3c）を実行 → プロジェクト活動の概観
+3. プロンプト本文（3a）を実行 → 定性分析用のテキストデータ取得
 
 ### ステップ2: 分析
 
@@ -251,9 +272,9 @@ index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
 
 **定量分析（SPLの集計結果から）:**
 - ユーザー別アクティビティランキング
-- ツール別利用分布
 - プロンプト長の分布・推移
 - プロジェクト別活動量
+- セッション数・頻度
 
 **定性分析（プロンプト本文から、既存ロジック流用）:**
 - 技術理解度マップ（ユーザー別）
@@ -267,7 +288,7 @@ index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
 
 ---
 
-## 4. 組織レポートテンプレート（追加セクション）
+## 5. 組織レポートテンプレート（追加セクション）
 
 既存の個人レポートテンプレートに以下を追加:
 
@@ -278,24 +299,24 @@ index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
 
 - **分析期間**: YYYY-MM-DD 〜 YYYY-MM-DD
 - **アクティブユーザー数**: N名
-- **総メッセージ数**: N件
-- **利用ツール**: Claude Code, Copilot Chat, ...
+- **総メッセージ数**: N件（短文肯定応答M件を除外）
+- **アクティブプロジェクト数**: N件
 
 ### ユーザー別アクティビティ
 
-| ユーザー | メッセージ数 | 主要ツール | 主要プロジェクト | 平均プロンプト長 |
-|---------|-------------|-----------|----------------|----------------|
+| ユーザー(host) | メッセージ数 | セッション数 | プロジェクト数 | 平均プロンプト長 |
+|---------------|-------------|-------------|--------------|----------------|
 
-### ツール利用分布
+### プロジェクト別アクティビティ
 
-| ツール | 利用者数 | メッセージ数 | 割合 |
-|--------|---------|-------------|------|
+| プロジェクト | メッセージ数 | ユーザー数 | セッション数 | 主な作業内容 |
+|-------------|-------------|-----------|-------------|-------------|
 ```
 
 ### ユーザー別分析（既存を拡張）
 
 ```markdown
-## N. ユーザー別分析: [ユーザー名]
+## N. ユーザー別分析: [ホスト名/ユーザー名]
 
 ### 技術理解度マップ
 （既存テンプレートと同じ）
@@ -325,34 +346,34 @@ index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
 
 ---
 
-## 5. 引数設計
+## 6. 引数設計
 
 ```
 /prompt-review-org                    # 全ユーザー、過去7日分
 /prompt-review-org 30                 # 過去30日分
-/prompt-review-org tanaka             # 特定ユーザーのみ
+/prompt-review-org tanaka             # 特定ユーザー(host)のみ
 /prompt-review-org tanaka 30          # 特定ユーザー × 過去30日分
 ```
 
 ---
 
-## 6. 実装ステップ
+## 7. 実装ステップ
 
-1. **Splunk Enterprise 環境準備**
-   - index `ai_prompt_logs` 作成
-   - HEC トークン発行
-   - sourcetype `ai_prompt_review` 設定
+1. ~~Splunk Enterprise 環境準備~~ → **完了**
+   - index `claude_code` 作成済み
+   - HEC 設定済み
+   - sourcetype `claude:session` で受信中
 
-2. **データパイプライン構築**
-   - collect.py に `--emit-otel` オプション追加
-   - OTel Collector 設定・デプロイ
-   - テストデータ送信・確認
+2. ~~データパイプライン構築~~ → **完了**
+   - OTel Collector filelog receiver でセッション JSONL を監視
+   - Splunk HEC exporter で送信
+   - データ受信確認済み
 
-3. **Splunk Enterprise MCP 追加**
-   - `~/.claude.json` にMCPサーバー設定追加
-   - SPLクエリ実行の動作確認
+3. ~~Splunk Enterprise MCP 追加~~ → **完了**
+   - `mcp__splunk-mcp-server__splunk_run_query` で SPL 実行可能
+   - 接続確認済み（Splunk Enterprise 9.4.3）
 
-4. **スキル作成**
+4. **スキル作成** ← 次のステップ
    - `prompt-review-org/SKILL.md` 作成
    - SPLクエリ集作成
    - 組織レポートテンプレート作成
@@ -364,11 +385,13 @@ index=ai_prompt_logs sourcetype=ai_prompt_review earliest=-30d
 
 ---
 
-## 7. プライバシー・セキュリティ考慮
+## 8. プライバシー・セキュリティ考慮
 
 社内利用前提だが、以下は検討が必要:
 
-- **アクセス制御**: `ai_prompt_logs` indexへのアクセスをマネージャー/管理者に限定
-- **シークレット検出**: collect.py の既存のシークレットスキャンはそのまま機能する（Splunkに送信前にマスク）
-- **データ保持期間**: Splunk側のretention policyで管理
+- **アクセス制御**: `claude_code` index へのアクセスをマネージャー/管理者に限定
+- **シークレット検出**: 生ログにはクレデンシャルが含まれる可能性あり。
+  SPL側での検出・マスク、または OTel Collector の redaction processor での事前マスクを検討
+- **データ保持期間**: Splunk 側の retention policy で管理
 - **利用目的の周知**: メンバーにログ収集の目的・範囲を事前に説明
+- **アシスタント応答**: `type="assistant"` にもコード等が含まれる。分析対象は `type="user"` に限定
