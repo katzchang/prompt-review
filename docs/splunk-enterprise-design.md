@@ -348,12 +348,21 @@ MCP ツール `mcp__splunk-mcp-server__splunk_run_query` を使用してSPLク�
 
 ## 6. 引数設計
 
+### 組織レポート（一括分析）
 ```
 /prompt-review-org                    # 全ユーザー、過去7日分
 /prompt-review-org 30                 # 過去30日分
-/prompt-review-org tanaka             # 特定ユーザー(host)のみ
+```
+
+### 個人レポート（ユーザー指定）
+```
+/prompt-review-org tanaka             # 特定ユーザーのみ、過去7日分
 /prompt-review-org tanaka 30          # 特定ユーザー × 過去30日分
 ```
+
+ユーザー指定時は組織横断セクションを省略し、既存の個人向けスキル（prompt-review）と
+同等の深さで個人分析レポートを生成する。出力ファイル名は
+`reports/prompt-review-org-YYYY-MM-DD-<user>.md` とする。
 
 ---
 
@@ -373,12 +382,23 @@ MCP ツール `mcp__splunk-mcp-server__splunk_run_query` を使用してSPLク�
    - `mcp__splunk-mcp-server__splunk_run_query` で SPL 実行可能
    - 接続確認済み（Splunk Enterprise 9.4.3）
 
-4. **スキル作成** ← 次のステップ
-   - `prompt-review-org/SKILL.md` 作成
-   - SPLクエリ集作成
-   - 組織レポートテンプレート作成
+4. ~~スキル作成~~ → **完了**
+   - `prompt-review-org/SKILL.md` 作成済み
+   - SPLクエリ集作成済み
+   - 組織レポートテンプレート作成済み
+   - 動作確認済み（2026-03-26）
 
-5. **テスト・調整**
+5. **個人レポート対応**
+   - ユーザー指定時に個人特化レポートを生成
+   - 出力ファイル名: `prompt-review-org-YYYY-MM-DD-<user>.md`
+   - 組織横断セクションの省略ロジック
+
+6. **ユーザー識別の改善**
+   - OTel Collector resource processor で `user` 属性を付与
+   - `host` ベース → `user` ベースに切り替え
+   - SPLクエリ・レポートテンプレートの `host` → `user` 更新
+
+7. **テスト・調整**
    - 実データでの動作確認
    - SPLクエリのチューニング
    - レポート品質の調整
@@ -395,3 +415,30 @@ MCP ツール `mcp__splunk-mcp-server__splunk_run_query` を使用してSPLク�
 - **データ保持期間**: Splunk 側の retention policy で管理
 - **利用目的の周知**: メンバーにログ収集の目的・範囲を事前に説明
 - **アシスタント応答**: `type="assistant"` にもコード等が含まれる。分析対象は `type="user"` に限定
+
+---
+
+## 9. TODO: 将来の拡張
+
+### データ拡充
+
+- [ ] OTel resource processor で `user`, `team`, `role` 属性を付与
+- [ ] `team` / `role` は Splunk ルックアップテーブルでの管理も検討（異動対応）
+
+### assistant メッセージを活用した分析
+
+現状は `type="user"` のみ分析対象だが、`type="assistant"` も活用すると以下が可能:
+
+- [ ] **イテレーション回数分析**: セッション内の user/assistant 往復数 → 1回で伝わるか、何度もやり取りするか
+- [ ] **ツール利用パターン**: assistant の `tool_use.name`（Read/Edit/Bash等） → どんな作業にAIを使っているか
+- [ ] **エラー率**: assistant 応答中のエラー言及 → 手戻りの多い領域の特定
+- [ ] **トークン消費**: `usage.input_tokens`, `output_tokens` → ユーザー/プロジェクト別のAIコスト可視化
+- [ ] **応答時間**: `durationMs` → 重いタスクの特定
+
+### 組織横断の高度な分析
+
+- [ ] **「イテレーション回数 × 技術領域」クロス分析** — 組織として学習コストが高い技術の特定
+- [ ] **チーム間ベストプラクティス比較** — あるチームの効果的パターンを他チームに横展開
+- [ ] **トークン消費のプロジェクト別集計** — AIコストの可視化・予算配分の根拠
+- [ ] **オンボーディング効果測定** — 新メンバーのプロンプト品質・AI活用度の立ち上がり速度
+- [ ] **経験年数 × AI活用パターン** — シニア/ジュニアでの活用の違い
