@@ -75,7 +75,7 @@ def get_appdata_path() -> Path:
 
 
 def get_claude_dir() -> Path:
-    return Path.home() / ".claude"
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 
 
 def ts_to_iso(ts_ms: int) -> str:
@@ -203,7 +203,7 @@ def collect_claude_code(cutoff_ms: int | None, project_filter: str | None) -> di
                 if project_filter.lower().replace(" ", "-") not in dir_name.lower():
                     continue
 
-            # セッションJSONLファイルを走査（最新5件に制限）
+            # セッションJSONLファイルを走査（最新50件に制限）
             session_files = sorted(
                 [f for f in project_dir.glob("*.jsonl") if f.is_file()],
                 key=lambda p: p.stat().st_mtime,
@@ -302,38 +302,110 @@ def collect_copilot_chat(cutoff_ms: int | None, project_filter: str | None) -> d
     all_prompts = []
 
     for vscdb_path in workspace_storage.glob("*/state.vscdb"):
-        try:
-            conn = sqlite3.connect(str(vscdb_path))
-            cursor = conn.cursor()
+        # 接続前にカットオフチェックして I/O を削減
+        file_mtime_ms = int(vscdb_path.stat().st_mtime * 1000)
+        if cutoff_ms and file_mtime_ms < cutoff_ms:
+            continue
 
-            # memento/interactive-session にプロンプト履歴がある
-            cursor.execute(
-                "SELECT value FROM ItemTable WHERE key = 'memento/interactive-session'"
-            )
-            row = cursor.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    history = data.get("history", {})
-                    for mode_key, entries in history.items():
-                        if isinstance(entries, list):
-                            for entry in entries:
+        try:
+            with sqlite3.connect(str(vscdb_path)) as conn:
+                cursor = conn.cursor()
+
+                # memento/interactive-session にプロンプト履歴がある
+                cursor.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'memento/interactive-session'"
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    try:
+                        data = json.loads(row[0])
+                        history = data.get("history", {})
+                        for mode_key, entries in history.items():
+                            if isinstance(entries, list):
+                                for entry in entries:
+                                    text = entry.get("text", "").strip()
+                                    if text:
+                                        all_prompts.append({
+                                            "text": text[:500],
+                                            "timestamp": ts_to_iso(file_mtime_ms),
+                                            "timestamp_ms": file_mtime_ms,
+                                            "project": vscdb_path.parent.name[:12],
+                                        })
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+        except sqlite3.Error:
+            continue
+
+    if all_prompts:
+        result["status"] = "検出"
+        result["messages"] = all_prompts
+        timestamps = [m["timestamp"] for m in all_prompts if m["timestamp"] != "unknown"]
+        if timestamps:
+            result["period"] = f"{min(timestamps)} 〜 {max(timestamps)}"
+
+    return result
+
+
+def collect_cursor(cutoff_ms: int | None, project_filter: str | None) -> dict:
+    """Cursor の state.vscdb から aiService.prompts を収集"""
+    result = {"tool": "Cursor", "status": "未検出", "messages": [], "period": ""}
+
+    appdata = get_appdata_path()
+    workspace_storage = appdata / "Cursor" / "User" / "workspaceStorage"
+    if not workspace_storage.exists():
+        return result
+
+    all_prompts = []
+
+    for vscdb_path in workspace_storage.glob("*/state.vscdb"):
+        # 接続前にカットオフチェックして I/O を削減
+        file_mtime_ms = int(vscdb_path.stat().st_mtime * 1000)
+        if cutoff_ms and file_mtime_ms < cutoff_ms:
+            continue
+
+        try:
+            with sqlite3.connect(str(vscdb_path)) as conn:
+                cur = conn.cursor()
+
+                # aiService.prompts にユーザープロンプト履歴がある
+                cur.execute("SELECT value FROM ItemTable WHERE key = 'aiService.prompts'")
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        entries = json.loads(row[0])
+                        if not isinstance(entries, list):
+                            continue
+
+                        # workspace.json からプロジェクトパスを取得
+                        workspace_dir = vscdb_path.parent
+                        workspace_json = workspace_dir / "workspace.json"
+                        project_name = workspace_dir.name[:12]
+                        if workspace_json.exists():
+                            try:
+                                ws_data = json.loads(workspace_json.read_text(encoding="utf-8"))
+                                folder = ws_data.get("folder", "")
+                                if folder.startswith("file://"):
+                                    folder = folder[7:]
+                                project_name = Path(folder).name if folder else project_name
+                            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                                pass
+
+                        if project_filter:
+                            if project_filter.lower() not in project_name.lower():
+                                continue
+
+                        for entry in entries:
+                            if isinstance(entry, dict):
                                 text = entry.get("text", "").strip()
                                 if text:
-                                    # Copilot Chat にはタイムスタンプがないため、vscdbの更新日時を代用
-                                    file_mtime_ms = int(vscdb_path.stat().st_mtime * 1000)
-                                    if cutoff_ms and file_mtime_ms < cutoff_ms:
-                                        continue
                                     all_prompts.append({
                                         "text": text[:500],
                                         "timestamp": ts_to_iso(file_mtime_ms),
                                         "timestamp_ms": file_mtime_ms,
-                                        "project": vscdb_path.parent.name[:12],
+                                        "project": project_name,
                                     })
-                except (json.JSONDecodeError, AttributeError):
-                    pass
-
-            conn.close()
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
         except sqlite3.Error:
             continue
 
@@ -540,6 +612,201 @@ def collect_antigravity(cutoff_ms: int | None) -> dict:
     return result
 
 
+def collect_gemini_cli(cutoff_ms: int | None, project_filter: str | None) -> dict:
+    """Gemini CLI の会話履歴を収集（~/.gemini/tmp/<project_name_or_hash>/chats/ 配下）
+
+    新形式（v0.29+ 相当）: chats/session-*.json が JSON オブジェクト
+        {sessionId, projectHash, startTime, lastUpdated, messages: [{id, timestamp, type, content}]}
+    旧形式（JSONL）: chats/session-*.jsonl が1行1エントリの JSONL
+    旧形式（手動保存）: chats/checkpoint-*.json が JSON 配列 [{role, parts}]
+    """
+    result = {"tool": "Gemini CLI", "status": "未検出", "messages": [], "period": ""}
+
+    gemini_tmp = Path.home() / ".gemini" / "tmp"
+    if not gemini_tmp.exists():
+        return result
+
+    all_messages = []
+
+    for project_dir in sorted(gemini_tmp.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not project_dir.is_dir():
+            continue
+
+        chats_dir = project_dir / "chats"
+        if not chats_dir.exists():
+            continue
+
+        project_name = project_dir.name
+
+        # project_filter: 新形式ではディレクトリ名がプロジェクト名（例: "gemini-cli"）のため部分一致フィルタを適用。
+        # ディレクトリ名がハッシュ値（64文字の16進数）の場合は逆引き不可のためスキップしない。
+        is_hash_dir = len(project_name) == 64 and all(c in "0123456789abcdef" for c in project_name.lower())
+        if project_filter and not is_hash_dir and project_filter.lower() not in project_name.lower():
+            continue
+
+        # 最新20件のチャットファイルを走査（.json / .jsonl 両対応）
+        chat_files = sorted(
+            list(chats_dir.glob("*.jsonl")) + list(chats_dir.glob("*.json")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:20]
+
+        for chat_file in chat_files:
+            file_mtime_ms = int(chat_file.stat().st_mtime * 1000)
+            if cutoff_ms and file_mtime_ms < cutoff_ms:
+                continue
+
+            try:
+                if chat_file.suffix == ".jsonl":
+                    # 旧形式（JSONL）: 1行1エントリ
+                    # 各行: session_metadata | user | gemini | message_update
+                    session_start_ms = None
+                    msg_count = 0
+                    with open(chat_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+
+                            entry_type = entry.get("type", "")
+
+                            if entry_type == "session_metadata":
+                                start_time = entry.get("startTime", "")
+                                if start_time:
+                                    session_start_ms = iso_to_ms(start_time)
+                                continue
+
+                            if entry_type != "user":
+                                continue
+
+                            content = entry.get("content", [])
+                            texts = []
+                            if isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        text = part.get("text", "").strip()
+                                        if text:
+                                            texts.append(text)
+
+                            text = sanitize_text(" ".join(texts).strip())
+                            if not text:
+                                continue
+
+                            ts_ms = session_start_ms or file_mtime_ms
+                            if cutoff_ms and ts_ms < cutoff_ms:
+                                continue
+
+                            all_messages.append({
+                                "text": text[:500],
+                                "timestamp": ts_to_iso(ts_ms),
+                                "timestamp_ms": ts_ms,
+                                "project": project_name,
+                            })
+                            msg_count += 1
+                            if msg_count >= 100:
+                                break
+                else:
+                    # .json ファイル: 新形式（セッションオブジェクト）または旧形式（配列）を判別
+                    with open(chat_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+
+                    if isinstance(data, dict) and "messages" in data:
+                        # 新形式: {"sessionId": ..., "messages": [{id, timestamp, type, content}]}
+                        session_start_time = data.get("startTime", "")
+                        session_start_ms = iso_to_ms(session_start_time) if session_start_time else file_mtime_ms
+                        msg_count = 0
+                        for msg in data["messages"]:
+                            if not isinstance(msg, dict):
+                                continue
+                            if msg.get("type") != "user":
+                                continue
+
+                            # メッセージ単位のタイムスタンプ（ISO 8601）を優先
+                            msg_ts_str = msg.get("timestamp", "")
+                            ts_ms = (iso_to_ms(msg_ts_str) if msg_ts_str else None) or session_start_ms or file_mtime_ms
+
+                            if cutoff_ms and ts_ms < cutoff_ms:
+                                continue
+
+                            content = msg.get("content", [])
+                            texts = []
+                            if isinstance(content, list):
+                                for part in content:
+                                    if not isinstance(part, dict):
+                                        continue
+                                    raw = part.get("text", "").strip()
+                                    if not raw:
+                                        continue
+                                    # @ファイル参照で注入された内容を除去:
+                                    # "--- Content from referenced files ---" 以降はシステム注入コンテンツ
+                                    if "--- Content from referenced files ---" in raw:
+                                        # このパート内で分割（プロンプトテキスト側を取る）
+                                        raw = raw.split("--- Content from referenced files ---")[0].strip()
+                                        if raw:
+                                            texts.append(raw)
+                                        break  # 以降のパートも注入コンテンツなのでスキップ
+                                    # "--- End of content ---" のみのパートもスキップ
+                                    if raw == "--- End of content ---":
+                                        break
+                                    texts.append(raw)
+
+                            text = sanitize_text(" ".join(texts).strip())
+                            if not text:
+                                continue
+
+                            all_messages.append({
+                                "text": text[:500],
+                                "timestamp": ts_to_iso(ts_ms or file_mtime_ms),
+                                "timestamp_ms": ts_ms or file_mtime_ms,
+                                "project": project_name,
+                            })
+                            msg_count += 1
+                            if msg_count >= 100:
+                                break
+
+                    elif isinstance(data, list):
+                        # 旧形式（手動保存チェックポイント）: [{role, parts}]
+                        msg_count = 0
+                        for msg in data:
+                            if not isinstance(msg, dict):
+                                continue
+                            if msg.get("role") != "user":
+                                continue
+                            parts = msg.get("parts", [])
+                            texts = [
+                                p.get("text", "").strip()
+                                for p in parts
+                                if isinstance(p, dict) and p.get("text", "").strip()
+                            ]
+                            text = sanitize_text(" ".join(texts).strip())
+                            if text:
+                                all_messages.append({
+                                    "text": text[:500],
+                                    "timestamp": ts_to_iso(file_mtime_ms),
+                                    "timestamp_ms": file_mtime_ms,
+                                    "project": project_name,
+                                })
+                                msg_count += 1
+                                if msg_count >= 100:
+                                    break
+
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+    if all_messages:
+        result["status"] = "検出"
+        result["messages"] = all_messages
+        timestamps = [m["timestamp"] for m in all_messages if m["timestamp"] != "unknown"]
+        if timestamps:
+            result["period"] = f"{min(timestamps)} 〜 {max(timestamps)}"
+
+    return result
+
+
 def collect_codex(cutoff_ms: int | None, project_filter: str | None) -> dict:
     """OpenAI Codex CLI の rollout JSONL からユーザープロンプトを収集"""
     result = {"tool": "OpenAI Codex", "status": "未検出", "messages": [], "period": ""}
@@ -580,18 +847,22 @@ def collect_codex(cutoff_ms: int | None, project_filter: str | None) -> dict:
                     except json.JSONDecodeError:
                         continue
 
+                    entry_type = entry.get("type", "")
+                    payload = entry.get("payload")
+                    if not entry_type or not isinstance(payload, dict):
+                        continue
+
                     timestamp_str = entry.get("timestamp", "")
 
-                    # SessionMeta からプロジェクト情報を取得
-                    session_meta = entry.get("SessionMeta") or entry.get("session_meta")
-                    if session_meta:
-                        cwd = session_meta.get("cwd", "") or session_meta.get("working_directory", "")
+                    # session_meta からプロジェクト情報を取得
+                    if entry_type == "session_meta":
+                        cwd = payload.get("cwd", "")
                         continue
 
-                    # ResponseItem からユーザーメッセージを抽出
-                    response_item = entry.get("ResponseItem") or entry.get("response_item")
-                    if not response_item:
+                    # response_item からユーザーメッセージを抽出
+                    if entry_type != "response_item":
                         continue
+                    response_item = payload
 
                     item_type = response_item.get("type", "")
                     role = response_item.get("role", "")
@@ -823,10 +1094,12 @@ def main():
     sources = [
         collect_claude_code(cutoff_ms, args.project),
         collect_copilot_chat(cutoff_ms, args.project),
+        collect_cursor(cutoff_ms, args.project),
         collect_cline(cutoff_ms),
         collect_roo_code(cutoff_ms),
         collect_windsurf(cutoff_ms),
         collect_antigravity(cutoff_ms),
+        collect_gemini_cli(cutoff_ms, args.project),
         collect_codex(cutoff_ms, args.project),
         collect_opencode(cutoff_ms, args.project),
     ]

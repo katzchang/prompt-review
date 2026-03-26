@@ -3,8 +3,8 @@ name: prompt-review
 description: >
   このスキルは、ユーザーが「プロンプトをレビューして」「対話履歴を分析して」「理解度を診断して」
   と依頼したとき、または /prompt-review で呼び出されたときに使用する。
-  過去のAIエージェント対話履歴（Claude Code, GitHub Copilot Chat, Cline, Roo Code, Windsurf,
-  Antigravity, OpenCode）を読み取り、技術理解度・プロンプティングパターン・AI依存度を推定してレポートを生成する。
+  過去のAIエージェント対話履歴（Claude Code, GitHub Copilot Chat, Cursor, Cline, Roo Code, Windsurf,
+  Antigravity, Gemini CLI, OpenAI Codex, OpenCode）を読み取り、技術理解度・プロンプティングパターン・AI依存度を推定してレポートを生成する。
 disable-model-invocation: true
 allowed-tools: Read, Write, Glob, Grep, Bash
 context: fork
@@ -18,23 +18,26 @@ context: fork
 
 `$ARGUMENTS` を解析し、以下のルールで引数を処理する:
 
+- 引数なし → 全プロジェクト横断、過去7日分（デフォルト）
 - 数値のみ → **日数フィルタ**（例: `30` → 過去30日分）
+- `all` または `0` → **全期間**（日数フィルタなし）
 - 文字列のみ → **プロジェクト名フィルタ**（部分一致）
 - 文字列 + 数値 → **プロジェクト名** + **日数フィルタ**（例: `yonshogen 30`）
-- 引数なし → 全プロジェクト横断、過去7日分（デフォルト）
 
 ## ステップ1: データ収集（スクリプト実行）
 
 前処理スクリプト [scripts/collect.py](scripts/collect.py) を実行してデータを収集する。
-このスクリプトは Claude Code, GitHub Copilot Chat, Cline, Roo Code, Windsurf, Antigravity, OpenCode の
+このスクリプトは Claude Code, GitHub Copilot Chat, Cursor, Cline, Roo Code, Windsurf, Antigravity, Gemini CLI, OpenAI Codex, OpenCode の
 ログを自動検出し、フィルタ済みのJSON を標準出力に返す。
 
 ### 引数からスクリプトオプションを組み立てる
 
-`$ARGUMENTS` を解析し、Bash で以下のように実行する:
+`$ARGUMENTS` を解析し、Bash で以下のように実行する。
+**実行前にタイムスタンプ付きのファイル名を生成し、スクリプト出力の保存先と Read の参照先で同じパスを使うこと。**
 
 ```bash
-python ~/.claude/skills/prompt-review/scripts/collect.py [OPTIONS] > /tmp/prompt-review-data.json
+OUTFILE="/tmp/prompt-review-data_$(date +%Y%m%d%H%M%S).json"
+python ~/.claude/skills/prompt-review/scripts/collect.py [OPTIONS] > "$OUTFILE"
 ```
 
 - 引数なし → オプションなし（デフォルト: 過去7日分）
@@ -47,7 +50,7 @@ python ~/.claude/skills/prompt-review/scripts/collect.py [OPTIONS] > /tmp/prompt
 
 ### 出力の読み取り
 
-スクリプト実行後、`/tmp/prompt-review-data.json` を Read で読み込む。
+スクリプト実行後、上記で生成した `$OUTFILE` のパスを Read で読み込む。
 
 出力JSON構造:
 ```json
@@ -87,7 +90,7 @@ python ~/.claude/skills/prompt-review/scripts/collect.py [OPTIONS] > /tmp/prompt
 
 ## ステップ2: 分析
 
-Read で `/tmp/prompt-review-data.json` を読み込んだら、以下の観点で `messages` 配列内のユーザープロンプトを分析する。各観点について**具体的なエビデンス**（実際のプロンプト断片の引用）を必ず含めること。
+Read で `$OUTFILE`（ステップ1で生成したタイムスタンプ付きファイル）を読み込んだら、以下の観点で `messages` 配列内のユーザープロンプトを分析する。各観点について**具体的なエビデンス**（実際のプロンプト断片の引用）を必ず含めること。
 
 ### 前処理: プロジェクト別サマリーの作成と短文応答の除外
 

@@ -13,6 +13,8 @@
 | macOS | `~/.claude/` |
 | Linux | `~/.claude/` |
 
+環境変数 `CLAUDE_CONFIG_DIR` が設定されている場合は、そのパスを使用する。
+
 ### ファイル構造
 ```
 ~/.claude/
@@ -48,7 +50,7 @@
 3. `isMeta: true` のシステムメッセージはスキップ
 4. `<ide_opened_file>`, `<local-command-stdout>` 等のシステムタグを除外
 5. history.jsonl で収集済みのセッションIDはスキップ（重複排除）
-6. 各プロジェクト最新5ファイル、1ファイルあたりユーザーメッセージ100件上限
+6. 各プロジェクト最新50ファイル、1ファイルあたりユーザーメッセージ100件上限
 
 **重要**: VS Code拡張機能で使用した場合、`history.jsonl` にはエントリが記録されず、
 プロジェクト別セッションJSONLにのみ会話ログが保存される。両方のソースを読む必要がある。
@@ -91,7 +93,43 @@ sqlite3 "<path>/state.vscdb" "SELECT value FROM ItemTable WHERE key = 'chat.Chat
 
 ---
 
-## 3. Cline
+## 3. Cursor
+
+### 保存場所
+| OS | パス |
+|----|------|
+| Windows | `%APPDATA%\Cursor\User\workspaceStorage\*\state.vscdb` |
+| macOS | `~/Library/Application Support/Cursor/User/workspaceStorage/*/state.vscdb` |
+| Linux | `~/.config/Cursor/User/workspaceStorage/*/state.vscdb` |
+
+### ファイル形式
+SQLite データベース（`state.vscdb`）。VS Code 系と同様の workspaceStorage 構造。
+
+### ファイル構造
+```
+Cursor/User/workspaceStorage/
+├── {workspace-id}/
+│   ├── state.vscdb           # SQLite DB（チャット履歴含む）
+│   └── workspace.json        # ワークスペースパス（folder: file:///path/to/project）
+```
+
+### 抽出方法
+1. `aiService.prompts` キーからプロンプト履歴を取得
+2. 形式: `[{"text": "ユーザーの入力", "commandType": 4}, ...]`
+3. `workspace.json` の `folder` からプロジェクト名を取得（file:// プレフィックスを除去）
+4. タイムスタンプは state.vscdb の更新日時を代用（プロンプト単位のタイムスタンプは非公開）
+
+```bash
+sqlite3 "<path>/state.vscdb" "SELECT value FROM ItemTable WHERE key = 'aiService.prompts';"
+```
+
+### 注意事項
+- Cursor v0.43 以降では `composer.composerData` にも会話メタデータがあるが、プロンプト本文は `aiService.prompts` に格納
+- データベース形式は非公式のため、将来のバージョンで変更される可能性がある
+
+---
+
+## 4. Cline
 
 ### 保存場所
 | OS | パス |
@@ -119,7 +157,7 @@ saoudrizwan.claude-dev/
 
 ---
 
-## 4. Roo Code
+## 5. Roo Code
 
 ### 保存場所
 | OS | パス |
@@ -146,7 +184,7 @@ Cline と同じ手順。
 
 ---
 
-## 5. Windsurf (Cascade)
+## 6. Windsurf (Cascade)
 
 ### 保存場所
 | OS | パス |
@@ -174,7 +212,7 @@ Cline と同じ手順。
 
 ---
 
-## 6. Google Antigravity
+## 7. Google Antigravity
 
 ### 保存場所
 | OS | パス |
@@ -207,7 +245,97 @@ Cline と同じ手順。
 
 ---
 
-## 7. OpenAI Codex（CLI）
+## 8. Gemini CLI
+
+### 保存場所
+| OS | パス |
+|----|------|
+| Windows | `%USERPROFILE%\.gemini\tmp\<project_name_or_hash>\chats\` |
+| macOS | `~/.gemini/tmp/<project_name_or_hash>/chats/` |
+| Linux | `~/.gemini/tmp/<project_name_or_hash>/chats/` |
+
+新しいバージョン（v0.29+ 相当）では `<project_name>` はプロジェクトルートディレクトリのベース名（例: `gemini-cli`）。
+古いバージョンでは 64文字の16進数ハッシュ値（逆引き不可）。両形式が混在する場合がある。
+
+### ファイル構造
+```
+~/.gemini/tmp/
+├── {project_name}/               # 新形式: 人間が読めるプロジェクト名
+│   └── chats/
+│       └── session-YYYY-MM-DDTHH-MM-{id}.json    # セッションファイル（新形式）
+└── {project_hash}/               # 旧形式: 64文字16進数ハッシュ
+    └── chats/
+        ├── session-{id}.jsonl    # 自動セッション記録（旧JSONL形式）
+        └── checkpoint-{name}.json  # /chat save による手動保存
+```
+
+### ファイル形式
+
+**JSON形式（セッションオブジェクト、新形式）** — `session-*.json` がJSONオブジェクト
+
+```json
+{
+  "sessionId": "uuid",
+  "projectHash": "sha256...",
+  "startTime": "2026-03-06T04:16:33.678Z",
+  "lastUpdated": "2026-03-06T04:16:39.320Z",
+  "messages": [
+    {
+      "id": "uuid",
+      "timestamp": "2026-03-06T04:16:33.678Z",
+      "type": "user",
+      "content": [
+        {"text": "ユーザーの入力"},
+        {"text": "\n--- Content from referenced files ---"},
+        {"text": "注入されたファイル内容"},
+        {"text": "\n--- End of content ---"}
+      ]
+    },
+    {"id": "uuid", "timestamp": "...", "type": "gemini", "content": "AIの応答テキスト"},
+    {"id": "uuid", "timestamp": "...", "type": "info", "content": "システム情報"}
+  ]
+}
+```
+
+**JSONL形式（自動セッション、旧形式）** — `session-*.jsonl` が1行1エントリ
+
+各行が以下のいずれかのJSON:
+```json
+{"type": "session_metadata", "sessionId": "...", "projectHash": "...", "startTime": "2025-06-15T10:30:00Z"}
+{"type": "user", "id": "msg1", "content": [{"text": "ユーザーの入力"}]}
+{"type": "gemini", "id": "msg2", "content": [{"text": "AIの応答"}]}
+{"type": "message_update", "id": "msg2", "tokens": {"input": 10, "output": 5}}
+```
+
+**JSON形式（手動保存チェックポイント、旧形式）** — `checkpoint-*.json` がJSON配列
+
+```json
+[
+  {"role": "user", "parts": [{"text": "ユーザーの入力"}]},
+  {"role": "model", "parts": [{"text": "AIの応答"}]}
+]
+```
+
+### 抽出方法
+1. `~/.gemini/tmp/` 配下の全プロジェクトディレクトリを走査
+2. 各ディレクトリの `chats/` 配下のファイルを更新日時降順で最新20件取得
+3. `.json` ファイルはトップレベルが `dict` かつ `messages` キーを持つ場合は新形式として処理:
+   - `type == "user"` のメッセージの `content[].text` を抽出
+   - `--- Content from referenced files ---` パート以降はシステム注入コンテンツとして除外
+   - メッセージ単位の `timestamp`（ISO 8601）でカットオフフィルタを適用
+4. `.json` ファイルがリストの場合は旧形式: `role == "user"` の `parts[].text` を抽出
+5. `.jsonl` ファイルは1行ずつパース: `type == "user"` の行の `content[].text` を抽出
+6. タイムスタンプが取得できない場合はファイルの更新日時を使用
+
+### 注意事項
+- 新形式のプロジェクトディレクトリ名はプロジェクト名（`--project` フィルタで部分一致）
+- 旧形式のハッシュ名ディレクトリは逆引き不可のため `--project` フィルタをスキップして全件収集
+- デフォルトの保持期間は30日（`~/.gemini/settings.json` の `sessionRetention.maxAge` で変更可能）
+- 旧JSONL形式はメッセージ単位のタイムスタンプを持たず、セッション開始時刻を全メッセージに適用
+
+---
+
+## 9. OpenAI Codex（CLI）
 
 ### 保存場所
 | OS | パス |
@@ -230,34 +358,34 @@ Cline と同じ手順。
 ```
 
 ### rollout JSONL の形式
-各行がJSONオブジェクト。行の種別は以下のキーで判別する:
+各行がJSONオブジェクト。`type` フィールドで行の種別を判別し、データは `payload` に格納する:
 
-**SessionMeta（セッション開始時のメタ情報）**
+**session_meta（セッション開始時のメタ情報）**
 ```json
-{"timestamp": "2025-06-15T10:30:00.123Z", "SessionMeta": {"cwd": "/path/to/project", "model_provider": "openai", ...}}
+{"timestamp": "2025-06-15T10:30:00.123Z", "type": "session_meta", "payload": {"cwd": "/path/to/project", "model_provider": "openai", ...}}
 ```
 
-**ResponseItem（会話アイテム）**
+**response_item（会話アイテム）**
 ```json
-{"timestamp": "2025-06-15T10:30:01.000Z", "ResponseItem": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ユーザーの入力"}]}}
+{"timestamp": "2025-06-15T10:30:01.000Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ユーザーの入力"}]}}
 ```
 
 ### 抽出方法
 1. `~/.codex/sessions/` 配下の `rollout-*.jsonl` を再帰的に走査（最新50件）
-2. 各ファイルから `SessionMeta` 行の `cwd` でプロジェクト情報を取得
-3. `ResponseItem` で `type: "message"`, `role: "user"` のメッセージを抽出
-4. `content` 配列から `type: "input_text"` または `type: "text"` のパートを連結
-5. 1ファイルあたりユーザーメッセージ100件上限
+2. 各行の `type` と `payload` を読み取り、`type` が存在しない行はスキップ
+3. `session_meta` の `payload.cwd` でプロジェクト情報を取得
+4. `response_item` で `payload.type: "message"`, `payload.role: "user"` のメッセージを抽出
+5. `content` 配列から `type: "input_text"` または `type: "text"` のパートを連結
+6. 1ファイルあたりユーザーメッセージ100件上限
 
 ### 注意事項
 - セッションはグローバル保存（プロジェクト別ディレクトリではない）
-- プロジェクト情報は `SessionMeta` の `cwd` フィールドから取得
+- プロジェクト情報は `session_meta` の `payload.cwd` フィールドから取得
 - `state-v5.db` にもスレッドメタデータがあるが、会話内容は rollout JSONL に保存される
-- Codex は Rust 製のため、JSONL のキー名が CamelCase（`SessionMeta`, `ResponseItem`）
 
 ---
 
-## 8. OpenCode
+## 10. OpenCode
 
 ### 保存場所
 | OS | パス |
@@ -303,6 +431,7 @@ SQLite データベース（`opencode.db` または `opencode-<channel>.db`）
 - Claude Code: `timestamp` フィールド（Unix epoch ミリ秒）で比較
 - Cline/Roo Code: `task_metadata.json` のタイムスタンプで比較
 - GitHub Copilot Chat: セッションデータ内のタイムスタンプで比較
+- Cursor: state.vscdb の更新日時で比較（プロンプト単位のタイムスタンプは非公開）
 - OpenAI Codex: `timestamp` フィールド（ISO 8601）で比較
 - Windsurf/Antigravity: ファイルの更新日時で比較（正確なタイムスタンプが取れない場合）
 

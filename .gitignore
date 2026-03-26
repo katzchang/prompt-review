@@ -1,2 +1,7 @@
 # 生成されたレポート（個人情報を含む）
 reports/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
